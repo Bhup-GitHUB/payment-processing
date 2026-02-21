@@ -1,0 +1,20 @@
+[package]
+name = "payment-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+adapters = { path = "../../crates/adapters" }
+anyhow.workspace = true
+axum.workspace = true
+chrono.workspace = true
+domain = { path = "../../crates/domain" }
+futures-util.workspace = true
+redis.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
