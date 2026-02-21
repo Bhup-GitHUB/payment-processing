@@ -1,0 +1,16 @@
+[package]
+name = "payment-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+adapters = { path = "../../crates/adapters" }
+anyhow.workspace = true
+chrono.workspace = true
+domain = { path = "../../crates/domain" }
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
