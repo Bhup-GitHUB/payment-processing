@@ -1,0 +1,11 @@
+[package]
+name = "observability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+tracing-subscriber.workspace = true

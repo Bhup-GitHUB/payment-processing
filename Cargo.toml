@@ -1,0 +1,32 @@
+[workspace]
+members = [
+  "apps/api",
+  "apps/worker",
+  "crates/domain",
+  "crates/adapters",
+  "crates/observability",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.7", features = ["ws"] }
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "migrate"] }
+redis = { version = "0.25", features = ["tokio-comp"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+metrics = "0.23"
+metrics-exporter-prometheus = "0.15"
+thiserror = "1"
+futures-util = "0.3"
