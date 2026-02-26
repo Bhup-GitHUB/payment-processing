@@ -59,11 +59,9 @@ impl PubSub for RedisPubSub {
 
     async fn publish_bulk(&self, requests: &[(&str, &[u8])]) -> anyhow::Result<()> {
         let mut conn = self.conn.clone();
-        let mut pipe = redis::pipe();
         for (channel, data) in requests {
-            pipe.publish(*channel, *data);
+            conn.publish::<_, _, ()>(*channel, *data).await?;
         }
-        pipe.query_async::<Vec<()>>(&mut conn).await?;
         Ok(())
     }
 
