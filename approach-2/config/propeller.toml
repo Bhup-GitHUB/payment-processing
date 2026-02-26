@@ -1,0 +1,21 @@
+[service]
+name = "propeller"
+
+[grpc]
+address = "0.0.0.0:50051"
+ping_interval_secs = 30
+ping_timeout_secs = 10
+enable_reflection = true
+
+[http]
+address = "0.0.0.0:8080"
+
+[broker]
+kind = "redis"
+address = "redis://127.0.0.1:6379"
+
+[client]
+header = "x-client-id"
+device_header = "x-device-id"
+enable_device_support = true
+device_attribute_headers = ["x-os", "x-app-version"]

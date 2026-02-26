@@ -1,0 +1,149 @@
+syntax = "proto3";
+
+package push.v1;
+
+// Core event payload exchanged between frontend and backend.
+message Event {
+    string name = 1;
+    EventFormatType format_type = 2;
+    bytes data = 3;
+
+    enum EventFormatType {
+        TYPE_JSON_UNSPECIFIED = 0;
+        TYPE_PROTOBUF = 1;
+    }
+}
+
+message ResponseStatus {
+    bool success = 1;
+    string error_code = 2;
+    map<string, string> message = 3;
+    string error_type = 4;
+}
+
+// -- Channel (bidirectional streaming) --
+
+message ChannelEvent {
+    Event event = 1;
+    string topic = 2;
+}
+
+message ChannelEventAck {
+    string event_id = 1;
+}
+
+message TopicSubscriptionRequest {
+    string topic = 1;
+}
+
+message TopicUnsubscriptionRequest {
+    string topic = 1;
+}
+
+message ChannelRequest {
+    oneof request {
+        ChannelEvent channel_event = 1;
+        ChannelEventAck channel_event_ack = 2;
+        TopicSubscriptionRequest topic_subscription_request = 3;
+        TopicUnsubscriptionRequest topic_unsubscription_request = 4;
+    }
+}
+
+message ConnectAck {
+    ResponseStatus status = 1;
+}
+
+message TopicSubscriptionRequestAck {
+    string topic = 1;
+    ResponseStatus status = 2;
+}
+
+message TopicUnsubscriptionRequestAck {
+    string topic = 1;
+    ResponseStatus status = 2;
+}
+
+message ChannelResponse {
+    oneof response {
+        ConnectAck connect_ack = 1;
+        ChannelEvent channel_event = 2;
+        ChannelEventAck channel_event_ack = 3;
+        TopicSubscriptionRequestAck topic_subscription_request_ack = 4;
+        TopicUnsubscriptionRequestAck topic_unsubscription_request_ack = 5;
+    }
+}
+
+// -- Unary RPCs --
+
+message SendEventToClientChannelRequest {
+    string client_id = 1;
+    Event event = 2;
+}
+
+message SendEventToClientChannelResponse {
+    ResponseStatus status = 1;
+}
+
+message SendEventToClientDeviceChannelRequest {
+    string client_id = 1;
+    string device_id = 2;
+    Event event = 3;
+}
+
+message SendEventToClientDeviceChannelResponse {
+    ResponseStatus status = 1;
+}
+
+message SendEventToTopicRequest {
+    string topic = 1;
+    Event event = 2;
+}
+
+message SendEventToTopicResponse {
+    ResponseStatus status = 1;
+}
+
+message SendEventToTopicsRequest {
+    repeated SendEventToTopicRequest requests = 1;
+}
+
+message SendEventToTopicsResponse {
+    ResponseStatus status = 1;
+}
+
+message GetClientActiveDevicesRequest {
+    string client_id = 1;
+}
+
+message Device {
+    string id = 1;
+    map<string, string> attributes = 2;
+}
+
+message GetClientActiveDevicesResponse {
+    ResponseStatus status = 1;
+    bool is_client_online = 2;
+    repeated Device devices = 3;
+}
+
+// -- Service --
+
+service PushService {
+    // Bidirectional streaming channel for frontend clients.
+    rpc Channel(stream ChannelRequest) returns (stream ChannelResponse);
+
+    // Backend sends event to a specific client.
+    rpc SendEventToClientChannel(SendEventToClientChannelRequest) returns (SendEventToClientChannelResponse);
+
+    // Backend sends event to a specific device of a client.
+    rpc SendEventToClientDeviceChannel(SendEventToClientDeviceChannelRequest) returns (SendEventToClientDeviceChannelResponse);
+
+    // Backend sends event to a topic.
+    rpc SendEventToTopic(SendEventToTopicRequest) returns (SendEventToTopicResponse);
+
+    // Backend sends event to multiple topics.
+    rpc SendEventToTopics(SendEventToTopicsRequest) returns (SendEventToTopicsResponse);
+
+    // List all active devices for a client.
+    rpc GetClientActiveDevices(GetClientActiveDevicesRequest) returns (GetClientActiveDevicesResponse);
+}
