@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::Context;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::broker::{PubSub, Subscription};
 use crate::config::ClientConfig;

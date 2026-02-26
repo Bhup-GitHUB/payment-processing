@@ -6,7 +6,7 @@ use dashmap::DashMap;
 use redis::aio::MultiplexedConnection;
 use redis::AsyncCommands;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use super::{PubSub, Subscription, TopicEvent};
@@ -63,7 +63,7 @@ impl PubSub for RedisPubSub {
         for (channel, data) in requests {
             pipe.publish(*channel, *data);
         }
-        pipe.query_async::<()>(&mut conn).await?;
+        pipe.query_async::<Vec<()>>(&mut conn).await?;
         Ok(())
     }
 
