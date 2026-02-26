@@ -4,13 +4,9 @@ use anyhow::Context;
 use async_trait::async_trait;
 use redis::aio::MultiplexedConnection;
 use redis::AsyncCommands;
-use tracing::debug;
 
 use super::KeyValue;
 
-/// Redis-backed KV store using hash maps.
-/// Each client_id is a Redis hash key, device_id is the field,
-/// and the value is a JSON-encoded map of device attributes.
 pub struct RedisKV {
     conn: MultiplexedConnection,
 }
@@ -28,7 +24,6 @@ impl KeyValue for RedisKV {
         conn.hset::<_, _, _, ()>(key, field, value)
             .await
             .context("redis hset failed")?;
-        debug!(key = key, field = field, "stored device attrs");
         Ok(())
     }
 

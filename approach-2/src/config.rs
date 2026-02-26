@@ -15,6 +15,7 @@ pub struct ServiceConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
 pub struct GrpcConfig {
     pub address: String,
     pub ping_interval_secs: u64,
@@ -28,6 +29,7 @@ pub struct HttpConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
 pub struct BrokerConfig {
     pub kind: String,
     pub address: String,

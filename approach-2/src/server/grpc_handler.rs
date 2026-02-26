@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use futures_util::Stream;
 use tokio::sync::mpsc;
@@ -9,6 +10,7 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info};
 
 use crate::config::ClientConfig;
+use crate::metrics::Metrics;
 use crate::push::models::{
     Device, GetActiveDevicesRequest, SendEventToClientDeviceRequest, SendEventToClientRequest,
     SendEventToTopicRequest,
@@ -31,20 +33,15 @@ use proto::{
 pub struct GrpcPushHandler {
     push_service: Arc<PushService>,
     client_config: ClientConfig,
+    metrics: Arc<Metrics>,
 }
 
 impl GrpcPushHandler {
-    pub fn new(push_service: Arc<PushService>, client_config: ClientConfig) -> Self {
-        Self {
-            push_service,
-            client_config,
-        }
+    pub fn new(push_service: Arc<PushService>, client_config: ClientConfig, metrics: Arc<Metrics>) -> Self {
+        Self { push_service, client_config, metrics }
     }
 
-    fn extract_client_device(
-        &self,
-        metadata: &tonic::metadata::MetadataMap,
-    ) -> Result<(String, Option<Device>), Status> {
+    fn extract_client_device(&self, metadata: &tonic::metadata::MetadataMap) -> Result<(String, Option<Device>), Status> {
         let client_id = metadata
             .get(&self.client_config.header)
             .and_then(|v| v.to_str().ok())
@@ -59,16 +56,13 @@ impl GrpcPushHandler {
                 .ok_or_else(|| Status::invalid_argument("missing device header"))?;
 
             let mut attrs = HashMap::new();
-            for header_key in &self.client_config.device_attribute_headers {
-                if let Some(val) = metadata.get(header_key).and_then(|v| v.to_str().ok()) {
-                    attrs.insert(header_key.clone(), val.to_string());
+            for key in &self.client_config.device_attribute_headers {
+                if let Some(val) = metadata.get(key).and_then(|v| v.to_str().ok()) {
+                    attrs.insert(key.clone(), val.to_string());
                 }
             }
 
-            Some(Device {
-                id: device_id,
-                attributes: attrs,
-            })
+            Some(Device { id: device_id, attributes: attrs })
         } else {
             None
         };
@@ -84,6 +78,24 @@ impl GrpcPushHandler {
             error_type: String::new(),
         }
     }
+
+    fn err_status(err: &str) -> ResponseStatus {
+        let mut msg = HashMap::new();
+        msg.insert("message".to_string(), err.to_string());
+        ResponseStatus {
+            success: false,
+            error_code: String::new(),
+            message: msg,
+            error_type: String::new(),
+        }
+    }
+
+    fn extract_event(event: &Option<proto::Event>) -> (Vec<u8>, String) {
+        match event {
+            Some(e) => (e.data.clone(), e.name.clone()),
+            None => (Vec::new(), String::new()),
+        }
+    }
 }
 
 type ChannelStream = Pin<Box<dyn Stream<Item = Result<ChannelResponse, Status>> + Send>>;
@@ -92,8 +104,6 @@ type ChannelStream = Pin<Box<dyn Stream<Item = Result<ChannelResponse, Status>> 
 impl PushServiceTrait for GrpcPushHandler {
     type ChannelStream = ChannelStream;
 
-    /// Bidirectional streaming channel. This is the main entry point for
-    /// frontend clients. Equivalent to Propeller's Channel() in grpc_handler.go.
     async fn channel(
         &self,
         request: Request<Streaming<ChannelRequest>>,
@@ -110,10 +120,8 @@ impl PushServiceTrait for GrpcPushHandler {
             .await
             .map_err(Status::from)?;
 
-        // channel to send responses back to the client
         let (resp_tx, resp_rx) = mpsc::channel(128);
 
-        // send connect ack
         let ack = ChannelResponse {
             response: Some(proto::channel_response::Response::ConnectAck(ConnectAck {
                 status: Some(Self::ok_status()),
@@ -124,73 +132,54 @@ impl PushServiceTrait for GrpcPushHandler {
         }
 
         let push_service = self.push_service.clone();
+        let metrics = self.metrics.clone();
         let client_id_owned = client_id.clone();
         let device_owned = device.clone();
 
-        // spawn main event loop
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    // incoming message from the client
                     client_msg = inbound.message() => {
                         match client_msg {
                             Ok(Some(req)) => {
-                                handle_client_request(
-                                    &push_service,
-                                    &sub,
-                                    &resp_tx,
-                                    req,
-                                ).await;
+                                handle_client_request(&push_service, &sub, &resp_tx, req).await;
                             }
                             Ok(None) => {
-                                // client closed the stream
-                                debug!(client_id = client_id_owned, "client stream closed");
+                                debug!(client_id = client_id_owned, "stream closed");
                                 break;
                             }
                             Err(e) => {
-                                debug!(client_id = client_id_owned, error = %e, "client stream error");
+                                debug!(client_id = client_id_owned, error = %e, "stream error");
                                 break;
                             }
                         }
                     }
-
-                    // event from the broker subscription
                     event = sub.event_rx.recv() => {
                         match event {
                             Some(topic_event) => {
                                 let response = ChannelResponse {
-                                    response: Some(
-                                        proto::channel_response::Response::ChannelEvent(
-                                            proto::ChannelEvent {
-                                                event: Some(proto::Event {
-                                                    name: String::new(),
-                                                    format_type: 0,
-                                                    data: topic_event.event,
-                                                }),
-                                                topic: topic_event.topic.clone(),
-                                            },
-                                        ),
-                                    ),
+                                    response: Some(proto::channel_response::Response::ChannelEvent(
+                                        proto::ChannelEvent {
+                                            event: Some(proto::Event {
+                                                name: String::new(),
+                                                format_type: 0,
+                                                data: topic_event.event,
+                                            }),
+                                            topic: topic_event.topic,
+                                        },
+                                    )),
                                 };
+                                metrics.messages_delivered.fetch_add(1, Ordering::Relaxed);
                                 if resp_tx.send(Ok(response)).await.is_err() {
                                     break;
                                 }
-                                debug!(
-                                    client_id = client_id_owned,
-                                    topic = topic_event.topic,
-                                    "forwarded event to client"
-                                );
                             }
-                            None => {
-                                debug!(client_id = client_id_owned, "subscription channel closed");
-                                break;
-                            }
+                            None => break,
                         }
                     }
                 }
             }
 
-            // cleanup on disconnect
             push_service
                 .unsubscribe_client(&client_id_owned, &sub, device_owned.as_ref())
                 .await;
@@ -205,16 +194,7 @@ impl PushServiceTrait for GrpcPushHandler {
         request: Request<SendEventToClientChannelRequest>,
     ) -> Result<Response<SendEventToClientChannelResponse>, Status> {
         let req = request.into_inner();
-        let event_bytes = req
-            .event
-            .as_ref()
-            .map(|e| e.data.clone())
-            .unwrap_or_default();
-        let event_name = req
-            .event
-            .as_ref()
-            .map(|e| e.name.clone())
-            .unwrap_or_default();
+        let (event_bytes, event_name) = Self::extract_event(&req.event);
 
         self.push_service
             .publish_to_client(SendEventToClientRequest {
@@ -235,16 +215,7 @@ impl PushServiceTrait for GrpcPushHandler {
         request: Request<SendEventToClientDeviceChannelRequest>,
     ) -> Result<Response<SendEventToClientDeviceChannelResponse>, Status> {
         let req = request.into_inner();
-        let event_bytes = req
-            .event
-            .as_ref()
-            .map(|e| e.data.clone())
-            .unwrap_or_default();
-        let event_name = req
-            .event
-            .as_ref()
-            .map(|e| e.name.clone())
-            .unwrap_or_default();
+        let (event_bytes, event_name) = Self::extract_event(&req.event);
 
         self.push_service
             .publish_to_client_device(SendEventToClientDeviceRequest {
@@ -266,16 +237,7 @@ impl PushServiceTrait for GrpcPushHandler {
         request: Request<ProtoSendEventToTopicRequest>,
     ) -> Result<Response<SendEventToTopicResponse>, Status> {
         let req = request.into_inner();
-        let event_bytes = req
-            .event
-            .as_ref()
-            .map(|e| e.data.clone())
-            .unwrap_or_default();
-        let event_name = req
-            .event
-            .as_ref()
-            .map(|e| e.name.clone())
-            .unwrap_or_default();
+        let (event_bytes, event_name) = Self::extract_event(&req.event);
 
         self.push_service
             .publish_to_topic(SendEventToTopicRequest {
@@ -301,17 +263,8 @@ impl PushServiceTrait for GrpcPushHandler {
             .requests
             .into_iter()
             .map(|r| {
-                let event_bytes = r.event.as_ref().map(|e| e.data.clone()).unwrap_or_default();
-                let event_name = r
-                    .event
-                    .as_ref()
-                    .map(|e| e.name.clone())
-                    .unwrap_or_default();
-                SendEventToTopicRequest {
-                    topic: r.topic,
-                    event_name,
-                    event: event_bytes,
-                }
+                let (event_bytes, event_name) = Self::extract_event(&r.event);
+                SendEventToTopicRequest { topic: r.topic, event_name, event: event_bytes }
             })
             .collect();
 
@@ -333,19 +286,14 @@ impl PushServiceTrait for GrpcPushHandler {
 
         let devices = self
             .push_service
-            .get_active_devices(GetActiveDevicesRequest {
-                client_id: req.client_id,
-            })
+            .get_active_devices(GetActiveDevicesRequest { client_id: req.client_id })
             .await
             .map_err(Status::from)?;
 
         let is_online = !devices.is_empty();
         let proto_devices: Vec<proto::Device> = devices
             .into_iter()
-            .map(|d| proto::Device {
-                id: d.id,
-                attributes: d.attributes,
-            })
+            .map(|d| proto::Device { id: d.id, attributes: d.attributes })
             .collect();
 
         Ok(Response::new(GetClientActiveDevicesResponse {
@@ -356,7 +304,6 @@ impl PushServiceTrait for GrpcPushHandler {
     }
 }
 
-/// Handles incoming requests from the client on the bidirectional stream.
 async fn handle_client_request(
     push_service: &Arc<PushService>,
     sub: &crate::broker::Subscription,
@@ -373,72 +320,37 @@ async fn handle_client_request(
     match request {
         Req::TopicSubscriptionRequest(topic_req) => {
             let topic = topic_req.topic;
-            let result = push_service.topic_subscribe(&topic, sub).await;
-
-            let status = match result {
+            let status = match push_service.topic_subscribe(&topic, sub).await {
                 Ok(()) => GrpcPushHandler::ok_status(),
-                Err(e) => {
-                    let mut msg = HashMap::new();
-                    msg.insert("message".to_string(), e.to_string());
-                    ResponseStatus {
-                        success: false,
-                        error_code: String::new(),
-                        message: msg,
-                        error_type: String::new(),
-                    }
-                }
+                Err(e) => GrpcPushHandler::err_status(&e.to_string()),
             };
-
             let resp = ChannelResponse {
-                response: Some(
-                    proto::channel_response::Response::TopicSubscriptionRequestAck(
-                        proto::TopicSubscriptionRequestAck {
-                            topic,
-                            status: Some(status),
-                        },
-                    ),
-                ),
+                response: Some(proto::channel_response::Response::TopicSubscriptionRequestAck(
+                    proto::TopicSubscriptionRequestAck { topic, status: Some(status) },
+                )),
             };
             let _ = resp_tx.send(Ok(resp)).await;
         }
 
         Req::TopicUnsubscriptionRequest(unsub_req) => {
             let topic = unsub_req.topic;
-            let result = push_service.topic_unsubscribe(&topic, sub).await;
-
-            let status = match result {
+            let status = match push_service.topic_unsubscribe(&topic, sub).await {
                 Ok(()) => GrpcPushHandler::ok_status(),
-                Err(e) => {
-                    let mut msg = HashMap::new();
-                    msg.insert("message".to_string(), e.to_string());
-                    ResponseStatus {
-                        success: false,
-                        error_code: String::new(),
-                        message: msg,
-                        error_type: String::new(),
-                    }
-                }
+                Err(e) => GrpcPushHandler::err_status(&e.to_string()),
             };
-
             let resp = ChannelResponse {
-                response: Some(
-                    proto::channel_response::Response::TopicUnsubscriptionRequestAck(
-                        proto::TopicUnsubscriptionRequestAck {
-                            topic,
-                            status: Some(status),
-                        },
-                    ),
-                ),
+                response: Some(proto::channel_response::Response::TopicUnsubscriptionRequestAck(
+                    proto::TopicUnsubscriptionRequestAck { topic, status: Some(status) },
+                )),
             };
             let _ = resp_tx.send(Ok(resp)).await;
         }
 
-        Req::ChannelEvent(_event) => {
-            // client-to-server events can be handled here if needed
+        Req::ChannelEvent(_) => {
             debug!("received channel event from client");
         }
 
-        Req::ChannelEventAck(_ack) => {
+        Req::ChannelEventAck(_) => {
             debug!("received event ack from client");
         }
     }

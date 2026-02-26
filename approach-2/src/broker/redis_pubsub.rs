@@ -11,15 +11,12 @@ use uuid::Uuid;
 
 use super::{PubSub, Subscription, TopicEvent};
 
-/// Tracks one active pubsub listener so we can dynamically add/remove channels.
 struct ActiveSubscription {
     event_tx: mpsc::UnboundedSender<TopicEvent>,
     control_tx: mpsc::UnboundedSender<ControlMessage>,
 }
 
 enum ControlMessage {
-    AddChannel(String),
-    RemoveChannel(String),
     Shutdown,
 }
 
@@ -77,7 +74,6 @@ impl PubSub for RedisPubSub {
             control_tx,
         });
 
-        // create a dedicated connection for this subscriber
         let mut pubsub_conn = self.client
             .get_async_pubsub()
             .await
@@ -87,7 +83,6 @@ impl PubSub for RedisPubSub {
             pubsub_conn.subscribe(ch).await?;
         }
 
-        // spawn a task that listens for messages and control signals
         tokio::spawn(async move {
             let mut msg_stream = pubsub_conn.into_on_message();
 
@@ -101,37 +96,17 @@ impl PubSub for RedisPubSub {
                                     &msg.get_payload::<redis::Value>().unwrap_or(redis::Value::Nil)
                                 ).unwrap_or_default();
 
-                                let event = TopicEvent {
-                                    topic: channel,
-                                    event: payload,
-                                };
+                                let event = TopicEvent { topic: channel, event: payload };
                                 if event_tx.send(event).is_err() {
-                                    debug!(sub_id = %sub_id, "subscriber dropped, stopping listener");
                                     return;
                                 }
                             }
-                            None => {
-                                debug!(sub_id = %sub_id, "redis pubsub stream ended");
-                                return;
-                            }
+                            None => return,
                         }
                     }
                     ctrl = control_rx.recv() => {
                         match ctrl {
-                            Some(ControlMessage::Shutdown) | None => {
-                                debug!(sub_id = %sub_id, "shutting down subscription listener");
-                                return;
-                            }
-                            Some(ControlMessage::AddChannel(_channel)) => {
-                                // for dynamic subscribe we would need a mutable reference
-                                // to pubsub_conn, which we consumed with into_on_message().
-                                // in practice, create a new subscription for dynamic topics.
-                                // this is a known limitation we can revisit.
-                                debug!(sub_id = %sub_id, "dynamic add not supported in this listener, use a new subscribe call");
-                            }
-                            Some(ControlMessage::RemoveChannel(_channel)) => {
-                                debug!(sub_id = %sub_id, "dynamic remove not supported in this listener");
-                            }
+                            Some(ControlMessage::Shutdown) | None => return,
                         }
                     }
                 }
@@ -142,8 +117,6 @@ impl PubSub for RedisPubSub {
     }
 
     async fn add_subscription(&self, channel: &str, sub_id: Uuid) -> anyhow::Result<()> {
-        // For dynamic topic subscribe, we create a new dedicated listener
-        // and forward its events into the existing subscription's tx channel.
         let entry = self.subscriptions.get(&sub_id)
             .ok_or_else(|| anyhow::anyhow!("subscription {} not found", sub_id))?;
 
@@ -152,7 +125,7 @@ impl PubSub for RedisPubSub {
         let mut pubsub_conn = self.client
             .get_async_pubsub()
             .await
-            .context("failed to get pubsub connection for add_subscription")?;
+            .context("failed to get pubsub connection")?;
 
         let channel_owned = channel.to_string();
         pubsub_conn.subscribe(&channel_owned).await?;
@@ -165,8 +138,7 @@ impl PubSub for RedisPubSub {
                     &msg.get_payload::<redis::Value>().unwrap_or(redis::Value::Nil)
                 ).unwrap_or_default();
 
-                let event = TopicEvent { topic: ch, event: payload };
-                if event_tx.send(event).is_err() {
+                if event_tx.send(TopicEvent { topic: ch, event: payload }).is_err() {
                     return;
                 }
             }
@@ -175,10 +147,7 @@ impl PubSub for RedisPubSub {
         Ok(())
     }
 
-    async fn remove_subscription(&self, channel: &str, sub_id: Uuid) -> anyhow::Result<()> {
-        if let Some(entry) = self.subscriptions.get(&sub_id) {
-            let _ = entry.control_tx.send(ControlMessage::RemoveChannel(channel.to_string()));
-        }
+    async fn remove_subscription(&self, _channel: &str, _sub_id: Uuid) -> anyhow::Result<()> {
         Ok(())
     }
 

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
@@ -9,17 +10,16 @@ use futures_util::{SinkExt, StreamExt};
 use tracing::{debug, error, info};
 
 use crate::config::ClientConfig;
+use crate::metrics::Metrics;
 use crate::push::models::Device;
 use crate::push::service::PushService;
 
 pub struct WsState {
     pub push_service: Arc<PushService>,
     pub client_config: ClientConfig,
+    pub metrics: Arc<Metrics>,
 }
 
-/// Axum handler that upgrades HTTP to WebSocket at /ws/connect.
-/// Extracts client/device identification from HTTP headers (same as
-/// Propeller's websocket_handler.go), then runs the same event loop.
 pub async fn ws_connect(
     State(state): State<Arc<WsState>>,
     ws: WebSocketUpgrade,
@@ -27,7 +27,6 @@ pub async fn ws_connect(
 ) -> impl IntoResponse {
     let client_config = state.client_config.clone();
 
-    // extract client id from headers
     let client_id = headers
         .get(&client_config.header)
         .and_then(|v| v.to_str().ok())
@@ -42,17 +41,14 @@ pub async fn ws_connect(
             .to_string();
 
         let mut attrs = HashMap::new();
-        for header_key in &client_config.device_attribute_headers {
-            if let Some(val) = headers.get(header_key).and_then(|v| v.to_str().ok()) {
-                attrs.insert(header_key.clone(), val.to_string());
+        for key in &client_config.device_attribute_headers {
+            if let Some(val) = headers.get(key).and_then(|v| v.to_str().ok()) {
+                attrs.insert(key.clone(), val.to_string());
             }
         }
 
         if !device_id.is_empty() {
-            Some(Device {
-                id: device_id,
-                attributes: attrs,
-            })
+            Some(Device { id: device_id, attributes: attrs })
         } else {
             None
         }
@@ -76,11 +72,7 @@ async fn handle_ws(
 
     info!(client_id = client_id, "ws client connecting");
 
-    let mut sub = match state
-        .push_service
-        .subscribe_client(&client_id, device.as_ref())
-        .await
-    {
+    let mut sub = match state.push_service.subscribe_client(&client_id, device.as_ref()).await {
         Ok(s) => s,
         Err(e) => {
             error!(client_id = client_id, error = %e, "failed to subscribe ws client");
@@ -90,30 +82,20 @@ async fn handle_ws(
 
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    // send connect ack
-    let ack = serde_json::json!({
-        "type": "connect_ack",
-        "status": { "success": true }
-    });
-    if ws_tx
-        .send(Message::Text(ack.to_string().into()))
-        .await
-        .is_err()
-    {
+    let ack = serde_json::json!({ "type": "connect_ack", "status": { "success": true } });
+    if ws_tx.send(Message::Text(ack.to_string().into())).await.is_err() {
         return;
     }
 
-    // event loop: read from websocket and from broker subscription
     loop {
         tokio::select! {
             ws_msg = ws_rx.next() => {
                 match ws_msg {
                     Some(Ok(Message::Text(text))) => {
-                        debug!(client_id = client_id, "received ws message: {}", text);
-                        // could parse and handle topic subscribe/unsubscribe here
+                        debug!(client_id = client_id, "ws message: {}", text);
                     }
                     Some(Ok(Message::Close(_))) | None => {
-                        debug!(client_id = client_id, "ws client disconnected");
+                        debug!(client_id = client_id, "ws disconnected");
                         break;
                     }
                     Some(Err(e)) => {
@@ -123,7 +105,6 @@ async fn handle_ws(
                     _ => {}
                 }
             }
-
             event = sub.event_rx.recv() => {
                 match event {
                     Some(topic_event) => {
@@ -132,17 +113,12 @@ async fn handle_ws(
                             "topic": topic_event.topic,
                             "data": String::from_utf8_lossy(&topic_event.event),
                         });
-                        if ws_tx
-                            .send(Message::Text(payload.to_string().into()))
-                            .await
-                            .is_err()
-                        {
+                        state.metrics.messages_delivered.fetch_add(1, Ordering::Relaxed);
+                        if ws_tx.send(Message::Text(payload.to_string().into())).await.is_err() {
                             break;
                         }
                     }
-                    None => {
-                        break;
-                    }
+                    None => break,
                 }
             }
         }
