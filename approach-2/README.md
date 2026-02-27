@@ -63,6 +63,16 @@ grpcurl -plaintext -d '{
   - `tenant:{tenant}:topic:{topic}`
 - `legacy_header_mode=true` allows temporary header-only auth fallback. Track and remove this mode after migration.
 
+## Keepalive
+
+- gRPC transport keepalive uses `[grpc].ping_interval_secs` and `[grpc].ping_timeout_secs`.
+- WebSocket and gRPC stream-idle enforcement use `[keepalive]`:
+  - `ws_ping_interval_secs`
+  - `ws_pong_timeout_secs`
+  - `grpc_stream_idle_timeout_secs`
+- WS clients must reply to Ping frames with Pong.
+- gRPC channel clients must send periodic inbound frames to stay active.
+
 ## Architecture
 
 ```

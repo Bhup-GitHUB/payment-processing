@@ -11,6 +11,10 @@ pub struct Metrics {
     pub topic_unsubscribe_total: AtomicU64,
     pub topic_unsubscribe_error_total: AtomicU64,
     pub active_topic_listeners: AtomicU64,
+    pub ws_ping_sent_total: AtomicU64,
+    pub ws_pong_received_total: AtomicU64,
+    pub ws_keepalive_timeout_total: AtomicU64,
+    pub grpc_keepalive_timeout_total: AtomicU64,
 }
 
 impl Metrics {
@@ -26,6 +30,10 @@ impl Metrics {
             topic_unsubscribe_total: AtomicU64::new(0),
             topic_unsubscribe_error_total: AtomicU64::new(0),
             active_topic_listeners: AtomicU64::new(0),
+            ws_ping_sent_total: AtomicU64::new(0),
+            ws_pong_received_total: AtomicU64::new(0),
+            ws_keepalive_timeout_total: AtomicU64::new(0),
+            grpc_keepalive_timeout_total: AtomicU64::new(0),
         }
     }
 
@@ -41,6 +49,10 @@ impl Metrics {
             topic_unsubscribe_total: self.topic_unsubscribe_total.load(Ordering::Relaxed),
             topic_unsubscribe_error_total: self.topic_unsubscribe_error_total.load(Ordering::Relaxed),
             active_topic_listeners: self.active_topic_listeners.load(Ordering::Relaxed),
+            ws_ping_sent_total: self.ws_ping_sent_total.load(Ordering::Relaxed),
+            ws_pong_received_total: self.ws_pong_received_total.load(Ordering::Relaxed),
+            ws_keepalive_timeout_total: self.ws_keepalive_timeout_total.load(Ordering::Relaxed),
+            grpc_keepalive_timeout_total: self.grpc_keepalive_timeout_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -57,4 +69,8 @@ pub struct MetricsSnapshot {
     pub topic_unsubscribe_total: u64,
     pub topic_unsubscribe_error_total: u64,
     pub active_topic_listeners: u64,
+    pub ws_ping_sent_total: u64,
+    pub ws_pong_received_total: u64,
+    pub ws_keepalive_timeout_total: u64,
+    pub grpc_keepalive_timeout_total: u64,
 }

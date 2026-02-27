@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, close_code};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
@@ -10,7 +11,7 @@ use futures_util::{SinkExt, StreamExt};
 use tracing::{debug, error, info};
 
 use crate::auth::AuthService;
-use crate::config::ClientConfig;
+use crate::config::{ClientConfig, KeepaliveConfig};
 use crate::metrics::Metrics;
 use crate::push::models::Device;
 use crate::push::service::PushService;
@@ -19,6 +20,7 @@ pub struct WsState {
     pub push_service: Arc<PushService>,
     pub auth: Arc<AuthService>,
     pub client_config: ClientConfig,
+    pub keepalive: KeepaliveConfig,
     pub metrics: Arc<Metrics>,
 }
 
@@ -103,6 +105,9 @@ async fn handle_ws(
     };
 
     let (mut ws_tx, mut ws_rx) = socket.split();
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(state.keepalive.ws_ping_interval_secs));
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_pong_at = Instant::now();
 
     let ack = serde_json::json!({ "type": "connect_ack", "status": { "success": true } });
     if ws_tx.send(Message::Text(ack.to_string().into())).await.is_err() {
@@ -115,6 +120,17 @@ async fn handle_ws(
                 match ws_msg {
                     Some(Ok(Message::Text(text))) => {
                         debug!(client_id = client_id, "ws message: {}", text);
+                    }
+                    Some(Ok(Message::Pong(_))) => {
+                        last_pong_at = Instant::now();
+                        state.metrics.ws_pong_received_total.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        if ws_tx.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                        last_pong_at = Instant::now();
+                        state.metrics.ws_pong_received_total.fetch_add(1, Ordering::Relaxed);
                     }
                     Some(Ok(Message::Close(_))) | None => {
                         debug!(client_id = client_id, "ws disconnected");
@@ -142,6 +158,21 @@ async fn handle_ws(
                     }
                     None => break,
                 }
+            }
+            _ = ping_interval.tick() => {
+                if last_pong_at.elapsed() > Duration::from_secs(state.keepalive.ws_pong_timeout_secs) {
+                    state.metrics.ws_keepalive_timeout_total.fetch_add(1, Ordering::Relaxed);
+                    let close = Message::Close(Some(CloseFrame {
+                        code: close_code::POLICY,
+                        reason: "keepalive timeout".into(),
+                    }));
+                    let _ = ws_tx.send(close).await;
+                    break;
+                }
+                if ws_tx.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+                state.metrics.ws_ping_sent_total.fetch_add(1, Ordering::Relaxed);
             }
         }
     }

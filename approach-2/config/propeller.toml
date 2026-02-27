@@ -7,6 +7,11 @@ ping_interval_secs = 30
 ping_timeout_secs = 10
 enable_reflection = true
 
+[keepalive]
+ws_ping_interval_secs = 30
+ws_pong_timeout_secs = 10
+grpc_stream_idle_timeout_secs = 40
+
 [http]
 address = "0.0.0.0:8080"
 

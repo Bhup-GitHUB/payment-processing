@@ -8,6 +8,7 @@ mod push;
 mod server;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::routing::get;
 use axum::{Json, Router};
@@ -58,11 +59,14 @@ async fn main() -> anyhow::Result<()> {
         push_service.clone(),
         auth.clone(),
         cfg.client.clone(),
+        cfg.keepalive.clone(),
         metrics.clone(),
     );
     let grpc_addr = cfg.grpc.address.parse()?;
 
     let grpc_server = TonicServer::builder()
+        .http2_keepalive_interval(Some(Duration::from_secs(cfg.grpc.ping_interval_secs)))
+        .http2_keepalive_timeout(Some(Duration::from_secs(cfg.grpc.ping_timeout_secs)))
         .add_service(PushServiceServer::new(grpc_handler))
         .serve(grpc_addr);
 
@@ -72,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
         push_service: push_service.clone(),
         auth: auth.clone(),
         client_config: cfg.client.clone(),
+        keepalive: cfg.keepalive.clone(),
         metrics: metrics.clone(),
     });
 

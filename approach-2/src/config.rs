@@ -4,6 +4,7 @@ use serde::Deserialize;
 pub struct AppConfig {
     pub service: ServiceConfig,
     pub grpc: GrpcConfig,
+    pub keepalive: KeepaliveConfig,
     pub http: HttpConfig,
     pub broker: BrokerConfig,
     pub client: ClientConfig,
@@ -22,6 +23,13 @@ pub struct GrpcConfig {
     pub ping_interval_secs: u64,
     pub ping_timeout_secs: u64,
     pub enable_reflection: bool,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct KeepaliveConfig {
+    pub ws_ping_interval_secs: u64,
+    pub ws_pong_timeout_secs: u64,
+    pub grpc_stream_idle_timeout_secs: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -83,24 +91,37 @@ impl AppConfig {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
-        if !self.auth.enabled {
-            return Ok(());
+        if self.auth.enabled {
+            if self.auth.jwt.issuer.is_empty() {
+                anyhow::bail!("auth.jwt.issuer is required when auth is enabled");
+            }
+            if self.auth.jwt.audience.is_empty() {
+                anyhow::bail!("auth.jwt.audience is required when auth is enabled");
+            }
+            if self.auth.tenant_claim.is_empty() {
+                anyhow::bail!("auth.tenant_claim must not be empty");
+            }
+            if self.auth.jwt.hmac_secret.as_deref().unwrap_or("").is_empty() {
+                anyhow::bail!("auth.jwt.hmac_secret is required in this build");
+            }
+            if self.auth.jwt.jwks_url.as_deref().is_some() {
+                tracing::warn!("auth.jwt.jwks_url is configured but ignored in this build");
+            }
         }
-
-        if self.auth.jwt.issuer.is_empty() {
-            anyhow::bail!("auth.jwt.issuer is required when auth is enabled");
+        if self.grpc.ping_interval_secs == 0 {
+            anyhow::bail!("grpc.ping_interval_secs must be greater than zero");
         }
-        if self.auth.jwt.audience.is_empty() {
-            anyhow::bail!("auth.jwt.audience is required when auth is enabled");
+        if self.grpc.ping_timeout_secs == 0 {
+            anyhow::bail!("grpc.ping_timeout_secs must be greater than zero");
         }
-        if self.auth.tenant_claim.is_empty() {
-            anyhow::bail!("auth.tenant_claim must not be empty");
+        if self.keepalive.ws_ping_interval_secs == 0 {
+            anyhow::bail!("keepalive.ws_ping_interval_secs must be greater than zero");
         }
-        if self.auth.jwt.hmac_secret.as_deref().unwrap_or("").is_empty() {
-            anyhow::bail!("auth.jwt.hmac_secret is required in this build");
+        if self.keepalive.ws_pong_timeout_secs == 0 {
+            anyhow::bail!("keepalive.ws_pong_timeout_secs must be greater than zero");
         }
-        if self.auth.jwt.jwks_url.as_deref().is_some() {
-            tracing::warn!("auth.jwt.jwks_url is configured but ignored in this build");
+        if self.keepalive.grpc_stream_idle_timeout_secs == 0 {
+            anyhow::bail!("keepalive.grpc_stream_idle_timeout_secs must be greater than zero");
         }
         Ok(())
     }

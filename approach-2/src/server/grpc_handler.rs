@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use futures_util::Stream;
 use tokio::sync::mpsc;
@@ -10,7 +11,7 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info};
 
 use crate::auth::{AuthContext, AuthService};
-use crate::config::ClientConfig;
+use crate::config::{ClientConfig, KeepaliveConfig};
 use crate::error::PropellerError;
 use crate::metrics::Metrics;
 use crate::push::models::{
@@ -36,6 +37,7 @@ pub struct GrpcPushHandler {
     push_service: Arc<PushService>,
     auth: Arc<AuthService>,
     client_config: ClientConfig,
+    keepalive: KeepaliveConfig,
     metrics: Arc<Metrics>,
 }
 
@@ -44,12 +46,14 @@ impl GrpcPushHandler {
         push_service: Arc<PushService>,
         auth: Arc<AuthService>,
         client_config: ClientConfig,
+        keepalive: KeepaliveConfig,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             push_service,
             auth,
             client_config,
+            keepalive,
             metrics,
         }
     }
@@ -182,16 +186,21 @@ impl PushServiceTrait for GrpcPushHandler {
 
         let push_service = self.push_service.clone();
         let metrics = self.metrics.clone();
+        let keepalive = self.keepalive.clone();
         let tenant_owned = auth.tenant_id.clone();
         let client_id_owned = auth.client_id.clone();
         let device_owned = device.clone();
 
         tokio::spawn(async move {
+            let mut keepalive_tick = tokio::time::interval(Duration::from_secs(1));
+            keepalive_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut last_inbound_at = Instant::now();
             loop {
                 tokio::select! {
                     client_msg = inbound.message() => {
                         match client_msg {
                             Ok(Some(req)) => {
+                                last_inbound_at = Instant::now();
                                 handle_client_request(&push_service, &tenant_owned, &sub, &resp_tx, req, &metrics).await;
                             }
                             Ok(None) => {
@@ -225,6 +234,13 @@ impl PushServiceTrait for GrpcPushHandler {
                                 }
                             }
                             None => break,
+                        }
+                    }
+                    _ = keepalive_tick.tick() => {
+                        if last_inbound_at.elapsed() > Duration::from_secs(keepalive.grpc_stream_idle_timeout_secs) {
+                            metrics.grpc_keepalive_timeout_total.fetch_add(1, Ordering::Relaxed);
+                            let _ = resp_tx.send(Err(Status::deadline_exceeded("channel keepalive timeout"))).await;
+                            break;
                         }
                     }
                 }
