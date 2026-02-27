@@ -35,4 +35,5 @@ pub trait PubSub: Send + Sync + 'static {
     async fn add_subscription(&self, channel: &str, sub_id: Uuid) -> anyhow::Result<()>;
     async fn remove_subscription(&self, channel: &str, sub_id: Uuid) -> anyhow::Result<()>;
     async fn unsubscribe(&self, sub_id: Uuid) -> anyhow::Result<()>;
+    fn active_topic_listeners(&self) -> u64;
 }

@@ -9,6 +9,7 @@ use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use tracing::{debug, error, info};
 
+use crate::auth::AuthService;
 use crate::config::ClientConfig;
 use crate::metrics::Metrics;
 use crate::push::models::Device;
@@ -16,6 +17,7 @@ use crate::push::service::PushService;
 
 pub struct WsState {
     pub push_service: Arc<PushService>,
+    pub auth: Arc<AuthService>,
     pub client_config: ClientConfig,
     pub metrics: Arc<Metrics>,
 }
@@ -26,12 +28,24 @@ pub async fn ws_connect(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let client_config = state.client_config.clone();
-
-    let client_id = headers
-        .get(&client_config.header)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let auth_result = state.auth.authenticate_http(&headers, &client_config);
+    let (auth, legacy_mode) = match auth_result {
+        Ok(value) => {
+            state.metrics.auth_success_total.fetch_add(1, Ordering::Relaxed);
+            if value.1 {
+                state
+                    .metrics
+                    .legacy_header_auth_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            value
+        }
+        Err(err) => {
+            state.metrics.auth_failure_total.fetch_add(1, Ordering::Relaxed);
+            error!(error = %err, "ws connection rejected by auth");
+            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+        }
+    };
 
     let device = if client_config.enable_device_support {
         let device_id = headers
@@ -56,12 +70,16 @@ pub async fn ws_connect(
         None
     };
 
-    ws.on_upgrade(move |socket| handle_ws(state, socket, client_id, device))
+    if legacy_mode {
+        info!(client_id = auth.client_id, "ws using legacy header auth");
+    }
+    ws.on_upgrade(move |socket| handle_ws(state, socket, auth.tenant_id, auth.client_id, device))
 }
 
 async fn handle_ws(
     state: Arc<WsState>,
     socket: WebSocket,
+    tenant_id: String,
     client_id: String,
     device: Option<Device>,
 ) {
@@ -72,7 +90,11 @@ async fn handle_ws(
 
     info!(client_id = client_id, "ws client connecting");
 
-    let mut sub = match state.push_service.subscribe_client(&client_id, device.as_ref()).await {
+    let mut sub = match state
+        .push_service
+        .subscribe_client(&tenant_id, &client_id, device.as_ref())
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             error!(client_id = client_id, error = %e, "failed to subscribe ws client");
@@ -126,6 +148,6 @@ async fn handle_ws(
 
     state
         .push_service
-        .unsubscribe_client(&client_id, &sub, device.as_ref())
+        .unsubscribe_client(&tenant_id, &client_id, &sub, device.as_ref())
         .await;
 }

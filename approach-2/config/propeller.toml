@@ -19,3 +19,16 @@ header = "x-client-id"
 device_header = "x-device-id"
 enable_device_support = true
 device_attribute_headers = ["x-os", "x-app-version"]
+
+[auth]
+enabled = true
+legacy_header_mode = true
+tenant_claim = "tenant_id"
+legacy_tenant = "legacy"
+api_keys = ["dev-publisher-key"]
+
+[auth.jwt]
+issuer = "propeller-dev"
+audience = "propeller-clients"
+clock_skew_secs = 30
+hmac_secret = "change-me-dev-secret"

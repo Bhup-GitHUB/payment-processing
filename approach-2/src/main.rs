@@ -1,3 +1,4 @@
+mod auth;
 mod broker;
 mod config;
 mod error;
@@ -15,6 +16,7 @@ use tonic::transport::Server as TonicServer;
 use tracing::info;
 
 use broker::redis_pubsub::RedisPubSub;
+use auth::AuthService;
 use config::AppConfig;
 use kv::redis_kv::RedisKV;
 use metrics::Metrics;
@@ -43,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
     let kv: Arc<dyn kv::KeyValue> = Arc::new(RedisKV::new(redis_conn));
 
     let metrics = Arc::new(Metrics::new());
+    let auth = Arc::new(AuthService::new(cfg.auth.clone()));
 
     let push_service = Arc::new(PushService::new(
         pubsub.clone(),
@@ -51,7 +54,12 @@ async fn main() -> anyhow::Result<()> {
         metrics.clone(),
     ));
 
-    let grpc_handler = GrpcPushHandler::new(push_service.clone(), cfg.client.clone(), metrics.clone());
+    let grpc_handler = GrpcPushHandler::new(
+        push_service.clone(),
+        auth.clone(),
+        cfg.client.clone(),
+        metrics.clone(),
+    );
     let grpc_addr = cfg.grpc.address.parse()?;
 
     let grpc_server = TonicServer::builder()
@@ -62,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
 
     let ws_state = Arc::new(WsState {
         push_service: push_service.clone(),
+        auth: auth.clone(),
         client_config: cfg.client.clone(),
         metrics: metrics.clone(),
     });
@@ -72,7 +81,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(|| async { "ok" }))
         .route("/metrics", get(move || {
             let m = metrics_ref.clone();
-            async move { Json(m.snapshot()) }
+            let pubsub = pubsub.clone();
+            async move {
+                let mut snapshot = m.snapshot();
+                snapshot.active_topic_listeners = pubsub.active_topic_listeners();
+                Json(snapshot)
+            }
         }))
         .with_state(ws_state);
 

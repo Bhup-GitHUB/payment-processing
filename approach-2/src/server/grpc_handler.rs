@@ -9,7 +9,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info};
 
+use crate::auth::{AuthContext, AuthService};
 use crate::config::ClientConfig;
+use crate::error::PropellerError;
 use crate::metrics::Metrics;
 use crate::push::models::{
     Device, GetActiveDevicesRequest, SendEventToClientDeviceRequest, SendEventToClientRequest,
@@ -32,42 +34,71 @@ use proto::{
 
 pub struct GrpcPushHandler {
     push_service: Arc<PushService>,
+    auth: Arc<AuthService>,
     client_config: ClientConfig,
     metrics: Arc<Metrics>,
 }
 
 impl GrpcPushHandler {
-    pub fn new(push_service: Arc<PushService>, client_config: ClientConfig, metrics: Arc<Metrics>) -> Self {
-        Self { push_service, client_config, metrics }
+    pub fn new(
+        push_service: Arc<PushService>,
+        auth: Arc<AuthService>,
+        client_config: ClientConfig,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        Self {
+            push_service,
+            auth,
+            client_config,
+            metrics,
+        }
     }
 
-    fn extract_client_device(&self, metadata: &tonic::metadata::MetadataMap) -> Result<(String, Option<Device>), Status> {
-        let client_id = metadata
-            .get(&self.client_config.header)
+    fn extract_device(&self, metadata: &tonic::metadata::MetadataMap) -> Result<Option<Device>, Status> {
+        if !self.client_config.enable_device_support {
+            return Ok(None);
+        }
+
+        let device_id = metadata
+            .get(&self.client_config.device_header)
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
-            .ok_or_else(|| Status::invalid_argument("missing client header"))?;
+            .unwrap_or("")
+            .to_string();
+        if device_id.is_empty() {
+            return Ok(None);
+        }
 
-        let device = if self.client_config.enable_device_support {
-            let device_id = metadata
-                .get(&self.client_config.device_header)
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-                .ok_or_else(|| Status::invalid_argument("missing device header"))?;
-
-            let mut attrs = HashMap::new();
-            for key in &self.client_config.device_attribute_headers {
-                if let Some(val) = metadata.get(key).and_then(|v| v.to_str().ok()) {
-                    attrs.insert(key.clone(), val.to_string());
-                }
+        let mut attrs = HashMap::new();
+        for key in &self.client_config.device_attribute_headers {
+            if let Some(val) = metadata.get(key).and_then(|v| v.to_str().ok()) {
+                attrs.insert(key.clone(), val.to_string());
             }
+        }
 
-            Some(Device { id: device_id, attributes: attrs })
-        } else {
-            None
-        };
+        Ok(Some(Device {
+            id: device_id,
+            attributes: attrs,
+        }))
+    }
 
-        Ok((client_id, device))
+    fn auth_client(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<(AuthContext, bool), Status> {
+        self.auth
+            .authenticate_grpc(metadata, &self.client_config)
+            .map_err(Status::from)
+    }
+
+    fn authorize_publisher(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<AuthContext, Status> {
+        self.auth
+            .authorize_api_key_grpc(metadata)
+            .map_err(Status::from)?;
+        let (ctx, _) = self.auth_client(metadata)?;
+        Ok(ctx)
     }
 
     fn ok_status() -> ResponseStatus {
@@ -109,14 +140,32 @@ impl PushServiceTrait for GrpcPushHandler {
         request: Request<Streaming<ChannelRequest>>,
     ) -> Result<Response<Self::ChannelStream>, Status> {
         let metadata = request.metadata().clone();
-        let (client_id, device) = self.extract_client_device(&metadata)?;
+        let (auth, legacy_mode) = match self.auth_client(&metadata) {
+            Ok(v) => {
+                self.metrics.auth_success_total.fetch_add(1, Ordering::Relaxed);
+                if v.1 {
+                    self.metrics
+                        .legacy_header_auth_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                v
+            }
+            Err(status) => {
+                self.metrics.auth_failure_total.fetch_add(1, Ordering::Relaxed);
+                return Err(status);
+            }
+        };
+        let device = self.extract_device(&metadata)?;
         let mut inbound = request.into_inner();
 
-        info!(client_id = client_id, "client connecting");
+        if legacy_mode {
+            info!(client_id = auth.client_id, "grpc channel using legacy header auth");
+        }
+        info!(tenant_id = auth.tenant_id, client_id = auth.client_id, "client connecting");
 
         let mut sub = self
             .push_service
-            .subscribe_client(&client_id, device.as_ref())
+            .subscribe_client(&auth.tenant_id, &auth.client_id, device.as_ref())
             .await
             .map_err(Status::from)?;
 
@@ -133,7 +182,8 @@ impl PushServiceTrait for GrpcPushHandler {
 
         let push_service = self.push_service.clone();
         let metrics = self.metrics.clone();
-        let client_id_owned = client_id.clone();
+        let tenant_owned = auth.tenant_id.clone();
+        let client_id_owned = auth.client_id.clone();
         let device_owned = device.clone();
 
         tokio::spawn(async move {
@@ -142,7 +192,7 @@ impl PushServiceTrait for GrpcPushHandler {
                     client_msg = inbound.message() => {
                         match client_msg {
                             Ok(Some(req)) => {
-                                handle_client_request(&push_service, &sub, &resp_tx, req).await;
+                                handle_client_request(&push_service, &tenant_owned, &sub, &resp_tx, req, &metrics).await;
                             }
                             Ok(None) => {
                                 debug!(client_id = client_id_owned, "stream closed");
@@ -181,7 +231,7 @@ impl PushServiceTrait for GrpcPushHandler {
             }
 
             push_service
-                .unsubscribe_client(&client_id_owned, &sub, device_owned.as_ref())
+                .unsubscribe_client(&tenant_owned, &client_id_owned, &sub, device_owned.as_ref())
                 .await;
         });
 
@@ -193,11 +243,13 @@ impl PushServiceTrait for GrpcPushHandler {
         &self,
         request: Request<SendEventToClientChannelRequest>,
     ) -> Result<Response<SendEventToClientChannelResponse>, Status> {
+        let publisher = self.authorize_publisher(request.metadata())?;
         let req = request.into_inner();
         let (event_bytes, event_name) = Self::extract_event(&req.event);
 
         self.push_service
             .publish_to_client(SendEventToClientRequest {
+                tenant_id: publisher.tenant_id,
                 client_id: req.client_id,
                 event_name,
                 event: event_bytes,
@@ -214,11 +266,13 @@ impl PushServiceTrait for GrpcPushHandler {
         &self,
         request: Request<SendEventToClientDeviceChannelRequest>,
     ) -> Result<Response<SendEventToClientDeviceChannelResponse>, Status> {
+        let publisher = self.authorize_publisher(request.metadata())?;
         let req = request.into_inner();
         let (event_bytes, event_name) = Self::extract_event(&req.event);
 
         self.push_service
             .publish_to_client_device(SendEventToClientDeviceRequest {
+                tenant_id: publisher.tenant_id,
                 client_id: req.client_id,
                 device_id: req.device_id,
                 event_name,
@@ -236,11 +290,13 @@ impl PushServiceTrait for GrpcPushHandler {
         &self,
         request: Request<ProtoSendEventToTopicRequest>,
     ) -> Result<Response<SendEventToTopicResponse>, Status> {
+        let publisher = self.authorize_publisher(request.metadata())?;
         let req = request.into_inner();
         let (event_bytes, event_name) = Self::extract_event(&req.event);
 
         self.push_service
             .publish_to_topic(SendEventToTopicRequest {
+                tenant_id: publisher.tenant_id,
                 topic: req.topic,
                 event_name,
                 event: event_bytes,
@@ -257,6 +313,7 @@ impl PushServiceTrait for GrpcPushHandler {
         &self,
         request: Request<SendEventToTopicsRequest>,
     ) -> Result<Response<SendEventToTopicsResponse>, Status> {
+        let publisher = self.authorize_publisher(request.metadata())?;
         let req = request.into_inner();
 
         let topic_requests: Vec<SendEventToTopicRequest> = req
@@ -264,7 +321,12 @@ impl PushServiceTrait for GrpcPushHandler {
             .into_iter()
             .map(|r| {
                 let (event_bytes, event_name) = Self::extract_event(&r.event);
-                SendEventToTopicRequest { topic: r.topic, event_name, event: event_bytes }
+                SendEventToTopicRequest {
+                    tenant_id: publisher.tenant_id.clone(),
+                    topic: r.topic,
+                    event_name,
+                    event: event_bytes,
+                }
             })
             .collect();
 
@@ -282,18 +344,34 @@ impl PushServiceTrait for GrpcPushHandler {
         &self,
         request: Request<GetClientActiveDevicesRequest>,
     ) -> Result<Response<GetClientActiveDevicesResponse>, Status> {
+        let (viewer, _) = self.auth_client(request.metadata())?;
         let req = request.into_inner();
+        let client_id = if req.client_id.is_empty() {
+            viewer.client_id.clone()
+        } else if req.client_id != viewer.client_id {
+            return Err(Status::from(PropellerError::PermissionDenied(
+                "client id mismatch".into(),
+            )));
+        } else {
+            req.client_id
+        };
 
         let devices = self
             .push_service
-            .get_active_devices(GetActiveDevicesRequest { client_id: req.client_id })
+            .get_active_devices(GetActiveDevicesRequest {
+                tenant_id: viewer.tenant_id,
+                client_id,
+            })
             .await
             .map_err(Status::from)?;
 
         let is_online = !devices.is_empty();
         let proto_devices: Vec<proto::Device> = devices
             .into_iter()
-            .map(|d| proto::Device { id: d.id, attributes: d.attributes })
+            .map(|d| proto::Device {
+                id: d.id,
+                attributes: d.attributes,
+            })
             .collect();
 
         Ok(Response::new(GetClientActiveDevicesResponse {
@@ -306,9 +384,11 @@ impl PushServiceTrait for GrpcPushHandler {
 
 async fn handle_client_request(
     push_service: &Arc<PushService>,
+    tenant_id: &str,
     sub: &crate::broker::Subscription,
     resp_tx: &mpsc::Sender<Result<ChannelResponse, Status>>,
     req: ChannelRequest,
+    metrics: &Arc<Metrics>,
 ) {
     use proto::channel_request::Request as Req;
 
@@ -320,13 +400,19 @@ async fn handle_client_request(
     match request {
         Req::TopicSubscriptionRequest(topic_req) => {
             let topic = topic_req.topic;
-            let status = match push_service.topic_subscribe(&topic, sub).await {
-                Ok(()) => GrpcPushHandler::ok_status(),
+            let status = match push_service.topic_subscribe(tenant_id, &topic, sub).await {
+                Ok(()) => {
+                    metrics.topic_subscribe_total.fetch_add(1, Ordering::Relaxed);
+                    GrpcPushHandler::ok_status()
+                }
                 Err(e) => GrpcPushHandler::err_status(&e.to_string()),
             };
             let resp = ChannelResponse {
                 response: Some(proto::channel_response::Response::TopicSubscriptionRequestAck(
-                    proto::TopicSubscriptionRequestAck { topic, status: Some(status) },
+                    proto::TopicSubscriptionRequestAck {
+                        topic,
+                        status: Some(status),
+                    },
                 )),
             };
             let _ = resp_tx.send(Ok(resp)).await;
@@ -334,13 +420,26 @@ async fn handle_client_request(
 
         Req::TopicUnsubscriptionRequest(unsub_req) => {
             let topic = unsub_req.topic;
-            let status = match push_service.topic_unsubscribe(&topic, sub).await {
-                Ok(()) => GrpcPushHandler::ok_status(),
-                Err(e) => GrpcPushHandler::err_status(&e.to_string()),
+            let status = match push_service.topic_unsubscribe(tenant_id, &topic, sub).await {
+                Ok(()) => {
+                    metrics
+                        .topic_unsubscribe_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    GrpcPushHandler::ok_status()
+                }
+                Err(e) => {
+                    metrics
+                        .topic_unsubscribe_error_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    GrpcPushHandler::err_status(&e.to_string())
+                }
             };
             let resp = ChannelResponse {
                 response: Some(proto::channel_response::Response::TopicUnsubscriptionRequestAck(
-                    proto::TopicUnsubscriptionRequestAck { topic, status: Some(status) },
+                    proto::TopicUnsubscriptionRequestAck {
+                        topic,
+                        status: Some(status),
+                    },
                 )),
             };
             let _ = resp_tx.send(Ok(resp)).await;

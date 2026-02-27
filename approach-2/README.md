@@ -26,11 +26,17 @@ Sits alongside your payment backends and handles all persistent client connectio
 ## Usage
 
 ### Connect a client (gRPC)
-Use `grpcurl` or any gRPC client. Pass `x-client-id` and `x-device-id` as metadata headers when opening a `Channel` stream.
+Use `grpcurl` or any gRPC client. Send an `authorization` bearer token with claims:
+- `sub` or `client_id`
+- `tenant_id` (configurable via `auth.tenant_claim`)
+
+During migration, `x-client-id` still works when `auth.legacy_header_mode=true`.
 
 ### Connect a client (WebSocket)
 ```bash
-websocat ws://localhost:8080/ws/connect -H "x-client-id: user_123" -H "x-device-id: iphone-15"
+websocat ws://localhost:8080/ws/connect \
+  -H "Authorization: Bearer <jwt>" \
+  -H "x-device-id: iphone-15"
 ```
 
 ### Send an event from your backend
@@ -41,8 +47,21 @@ grpcurl -plaintext -d '{
     "name": "payment.confirmed",
     "data": "eyJvcmRlcl9pZCI6ICIxMjMifQ=="
   }
-}' localhost:50051 push.v1.PushService/SendEventToClientChannel
+}' \
+  -H "authorization: Bearer <publisher-jwt>" \
+  -H "x-api-key: dev-publisher-key" \
+  localhost:50051 push.v1.PushService/SendEventToClientChannel
 ```
+
+## Auth and Tenancy
+
+- Auth is configured in `config/propeller.toml` under `[auth]`.
+- Tenant is derived from JWT claim (`tenant_id` by default).
+- Channels are tenant-scoped internally:
+  - `tenant:{tenant}:client:{client}`
+  - `tenant:{tenant}:client:{client}:device:{device}`
+  - `tenant:{tenant}:topic:{topic}`
+- `legacy_header_mode=true` allows temporary header-only auth fallback. Track and remove this mode after migration.
 
 ## Architecture
 
